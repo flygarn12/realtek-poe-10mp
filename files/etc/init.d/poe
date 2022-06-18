@@ -8,8 +8,8 @@ reload_service() {
 	ubus call poe reload
 }
 
-service_triggers() {                                
-        procd_add_config_trigger "config.change" "poe" ubus call poe reload
+service_triggers() {
+	procd_add_config_trigger "config.change" "poe" ubus call poe reload
 }
 
 start_service() {
