@@ -814,7 +814,7 @@ main(int argc, char ** argv)
 {
 	int ch;
 
-	ulog_open(ULOG_STDIO | ULOG_SYSLOG, LOG_DAEMON, "realtek-poe");
+	ulog_open(ULOG_STDIO | ULOG_SYSLOG, LOG_DAEMON, "realtek-poe-10mp");
 	ulog_threshold(LOG_INFO);
 
 	while ((ch = getopt(argc, argv, "d")) != -1) {

@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 2.6)
 
-PROJECT(realtek-poe C)
+PROJECT(realtek-poe-10mp C)
 ADD_DEFINITIONS(-Os -ggdb -Wextra -Wall -Werror --std=gnu99 -Wmissing-declarations -Wno-unused-parameter)
 
 SET(CMAKE_SHARED_LIBRARY_LINK_C_FLAGS "")
@@ -19,10 +19,10 @@ FIND_PATH(ubus_include_dir NAMES libubus.h)
 FIND_PATH(ubox_include_dir NAMES libubox/usock.h)
 INCLUDE_DIRECTORIES(${ubox_include_dir} ${ubus_include_dir} ${uci_include_dir})
 
-ADD_EXECUTABLE(realtek-poe ${SOURCES})
+ADD_EXECUTABLE(realtek-poe-10mp ${SOURCES})
 
-TARGET_LINK_LIBRARIES(realtek-poe ${ubox} ${ubus} ${uci})
+TARGET_LINK_LIBRARIES(realtek-poe-10mp ${ubox} ${ubus} ${uci})
 
-INSTALL(TARGETS realtek-poe
+INSTALL(TARGETS realtek-poe-10mp
 	RUNTIME DESTINATION sbin
 )

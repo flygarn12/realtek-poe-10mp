@@ -2,7 +2,7 @@
 
 START=80
 USE_PROCD=1
-PROG=/usr/bin/realtek-poe
+PROG=/usr/bin/realtek-poe-10mp
 
 reload_service() {
 	ubus call poe reload

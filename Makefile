@@ -1,25 +1,25 @@
 include $(TOPDIR)/rules.mk
 
-PKG_NAME:=realtek-poe
+PKG_NAME:=realtek-poe-10mp
 PKG_RELEASE:=1
 
 PKG_LICENSE:=GPL-2.0
-PKG_MAINTAINER:=John Crispin <john@phrozen.org>
+PKG_MAINTAINER:=flygarn12
 
 include $(INCLUDE_DIR)/package.mk
 include $(INCLUDE_DIR)/cmake.mk
 
-define Package/realtek-poe
+define Package/realtek-poe-10mp
   SECTION:=net
   CATEGORY:=Network
   TITLE:=Realtek PoE Switch Port daemon
   DEPENDS:=@TARGET_realtek +libubox +libubus +libuci
 endef
 
-define Package/realtek-poe/install
+define Package/realtek-poe-10mp/install
 	$(INSTALL_DIR) $(1)/usr/bin
-	$(INSTALL_BIN) $(PKG_BUILD_DIR)/realtek-poe $(1)/usr/bin/
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/realtek-poe-10mp $(1)/usr/bin/
 	$(CP) ./files/* $(1)
 endef
 
-$(eval $(call BuildPackage,realtek-poe))
+$(eval $(call BuildPackage,realtek-poe-10mp))
