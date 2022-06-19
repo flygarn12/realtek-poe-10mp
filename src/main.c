@@ -23,7 +23,7 @@
 
 typedef int (*poe_reply_handler)(unsigned char *reply);
 
-#define MAX_PORT	8
+#define MAX_PORT	24
 #define GET_STR(a, b)	(a < ARRAY_SIZE(b) ? b[a] : NULL)
 
 struct port_config {
@@ -386,7 +386,7 @@ poe_cmd_port_power_budget(unsigned char port, unsigned char budget)
 static int
 poe_cmd_power_mgmt_mode(unsigned char mode)
 {
-	unsigned char cmd[] = { 0x18, 0x00, mode };
+	unsigned char cmd[] = { 0x17, 0x00, mode };
 
 	return poe_cmd_queue(cmd, sizeof(cmd));
 }
@@ -608,8 +608,9 @@ poe_reply_consume(unsigned char *reply)
 
 	free(cmd);
 
-	if (reply_handler[reply[0]])
-		return reply_handler[reply[0]](reply);
+	if (reply_handler[reply[0]]) {
+	  return reply_handler[reply[0]](reply);
+	}
 
 	return 0;
 }
@@ -622,7 +623,6 @@ poe_stream_msg_cb(struct ustream *s, int bytes)
 
 	if (len < 12)
 		return;
-
 	poe_reply_consume(reply);
 	ustream_consume(s, 12);
 	poe_cmd_next();
@@ -801,7 +801,7 @@ ubus_poe_sendframe_cb(struct ubus_context *ctx, struct ubus_object *obj,
 	size_t cmd_len = 0;
 	unsigned long byte_val;
 	uint8_t cmd[9];
-	
+
 	blobmsg_parse(ubus_poe_sendframe_policy, __POE_SENDFRAME_MAX, tb, blob_data(msg), blob_len(msg));
 
 	if (!tb[POE_SENDFRAME_STRING])
@@ -838,7 +838,7 @@ ubus_poe_reload_cb(struct ubus_context *ctx, struct ubus_object *obj,
 static const struct ubus_method ubus_poe_methods[] = {
 	UBUS_METHOD_NOARG("info", ubus_poe_info_cb),
 	UBUS_METHOD_NOARG("reload", ubus_poe_reload_cb),
-	UBUS_METHOD("sendframe", ubus_poe_sendframe_cb, ubus_poe_sendframe_policy),	
+	UBUS_METHOD("sendframe", ubus_poe_sendframe_cb, ubus_poe_sendframe_policy),
 };
 
 static struct ubus_object_type ubus_poe_object_type =
@@ -885,6 +885,7 @@ main(int argc, char ** argv)
 
 	if (poe_stream_open("/dev/ttyS1", &stream, B19200) < 0)
 		return -1;
+
 
 	poe_initial_setup();
 	state_timeout.cb = state_timeout_cb;
