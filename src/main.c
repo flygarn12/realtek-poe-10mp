@@ -23,7 +23,7 @@
 
 typedef int (*poe_reply_handler)(unsigned char *reply);
 
-#define MAX_PORT	8
+#define MAX_PORT	24
 #define GET_STR(a, b)	(a < ARRAY_SIZE(b) ? b[a] : NULL)
 
 struct port_config {
@@ -80,6 +80,17 @@ static struct config config = {
 	.port_count = 8,
 };
 
+static uint16_t read16_be(uint8_t *raw)
+{
+	return (uint16_t)raw[0] << 8 | raw[1];
+}
+
+static void write16_be(uint8_t *raw, uint16_t value)
+{
+	raw[0] = value >> 8;
+	raw[1] =  value & 0xff;
+}
+
 static void
 config_load_port(struct uci_section *s)
 {
@@ -106,6 +117,7 @@ config_load_port(struct uci_section *s)
 	};
 
 	struct blob_attr *tb[__PORT_ATTR_MAX] = { 0 };
+	const char *name;
 	unsigned int id;
 
 	blob_buf_init(&b, 0);
@@ -113,18 +125,19 @@ config_load_port(struct uci_section *s)
 	blobmsg_parse(port_attrs, __PORT_ATTR_MAX, tb, blob_data(b.head), blob_len(b.head));
 
 	if (!tb[PORT_ATTR_ID] || !tb[PORT_ATTR_NAME]) {
-		ULOG_ERR("invalid port settings");
+		ULOG_ERR("invalid port with missing name and id");
 		return;
 	}
 
+	name = blobmsg_get_string(tb[PORT_ATTR_NAME]);
 	id = blobmsg_get_u32(tb[PORT_ATTR_ID]);
 	if (!id || id > MAX_PORT) {
-		ULOG_ERR("invalid port id");
+		ULOG_ERR("invalid port id=%u for %s", id, name);
 		return;
 	}
 	id--;
 
-	strncpy(config.ports[id].name, blobmsg_get_string(tb[PORT_ATTR_NAME]), 16);
+	strncpy(config.ports[id].name, name, 16);
 
 	if (tb[PORT_ATTR_ENABLE])
 		config.ports[id].enable = !!blobmsg_get_u32(tb[PORT_ATTR_ENABLE]);
@@ -276,6 +289,13 @@ poe_cmd_port_enable(unsigned char port, unsigned char enable)
 	return poe_cmd_queue(cmd, sizeof(cmd));
 }
 
+static int poe_cmd_port_mapping_enable(bool enable)
+{
+	unsigned char cmd[] = { 0x02, 0x00, enable };
+
+	return poe_cmd_queue(cmd, sizeof(cmd));
+}
+
 /* 0x06 - Set global port enable
  *	0: Disable PSE Functionality on all Ports
  *	1: Enable PSE Functionality on all Ports
@@ -366,7 +386,7 @@ poe_cmd_port_power_budget(unsigned char port, unsigned char budget)
 static int
 poe_cmd_power_mgmt_mode(unsigned char mode)
 {
-	unsigned char cmd[] = { 0x18, 0x00, mode };
+	unsigned char cmd[] = { 0x17, 0x00, mode };
 
 	return poe_cmd_queue(cmd, sizeof(cmd));
 }
@@ -377,10 +397,8 @@ poe_cmd_global_power_budget(int budget, int guard)
 {
 	unsigned char cmd[] = { 0x18, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
 
-	cmd[3] = budget * 10 / 256;
-	cmd[4] = budget * 10 % 256;
-	cmd[5] = guard * 10 / 256;
-	cmd[6] = guard * 10 % 256;
+	write16_be(cmd + 3, budget * 10);
+	write16_be(cmd + 5, guard * 10);
 
 	return poe_cmd_queue(cmd, sizeof(cmd));
 }
@@ -471,10 +489,7 @@ poe_cmd_power_stats(void)
 static int
 poe_reply_power_stats(unsigned char *reply)
 {
-	state.power_consumption = reply[2];
-	state.power_consumption *= 256;
-	state.power_consumption += reply[3];
-	state.power_consumption /= 10;
+	state.power_consumption = read16_be(reply + 2) * 0.1;
 
 	return 0;
 }
@@ -525,7 +540,7 @@ poe_reply_port_overview(unsigned char *reply)
 	};
 	int i;
 
-	for (i = 0; i < 8; i++)
+	for (i = 0; i < MAX_PORT; i++)
 		state.ports[i].status = GET_STR((reply[3 + i] & 0xf), status);
 
 	return 0;
@@ -543,15 +558,9 @@ poe_cmd_port_power_stats(unsigned char port)
 static int
 poe_reply_port_power_stats(unsigned char *reply)
 {
-	float watt;
+	int port_idx = reply[2];
 
-	watt = reply[9];
-	watt *= 256;
-	watt += reply[10];
-	watt /= 10;
-
-	state.ports[reply[2]].watt = watt;
-
+	state.ports[port_idx].watt = read16_be(reply + 9) * 0.1;
 	return 0;
 }
 
@@ -587,7 +596,7 @@ poe_reply_consume(unsigned char *reply)
 		return -1;
 	}
 
-	if (reply[0] != cmd->cmd[0]) {
+	if ((reply[0] != cmd->cmd[0]) || (reply[0] > ARRAY_SIZE(reply_handler))) {
 		ULOG_DBG("received reply with bad command id\n");
 		return -1;
 	}
@@ -599,8 +608,9 @@ poe_reply_consume(unsigned char *reply)
 
 	free(cmd);
 
-	if (reply_handler[reply[0]])
-		return reply_handler[reply[0]](reply);
+	if (reply_handler[reply[0]]) {
+	  return reply_handler[reply[0]](reply);
+	}
 
 	return 0;
 }
@@ -613,7 +623,6 @@ poe_stream_msg_cb(struct ustream *s, int bytes)
 
 	if (len < 12)
 		return;
-
 	poe_reply_consume(reply);
 	ustream_consume(s, 12);
 	poe_cmd_next();
@@ -632,8 +641,17 @@ poe_stream_notify_cb(struct ustream *s)
 static int
 poe_stream_open(char *dev, struct ustream_fd *s, speed_t speed)
 {
-	struct termios tio;
-	int tty;
+	int ret, tty;
+
+	struct termios tio = {
+		.c_oflag = 0,
+		.c_iflag = 0,
+		.c_cflag = speed | CS8 | CREAD | CLOCAL,
+		.c_lflag = 0,
+		.c_cc = {
+			[VMIN] = 1,
+		}
+	};
 
 	tty = open(dev, O_RDWR | O_NOCTTY | O_NONBLOCK);
 	if (tty < 0) {
@@ -641,21 +659,11 @@ poe_stream_open(char *dev, struct ustream_fd *s, speed_t speed)
 		return -1;
 	}
 
-	tcgetattr(tty, &tio);
-	tio.c_cflag |= CREAD;
-	tio.c_cflag |= CS8;
-	tio.c_iflag |= IGNPAR;
-	tio.c_lflag &= ~(ICANON);
-	tio.c_lflag &= ~(ECHO);
-	tio.c_lflag &= ~(ECHOE);
-	tio.c_lflag &= ~(ISIG);
-	tio.c_iflag &= ~(IXON | IXOFF | IXANY);
-	tio.c_cflag &= ~CRTSCTS;
-	tio.c_cc[VMIN] = 1;
-	tio.c_cc[VTIME] = 0;
-	cfsetispeed(&tio, speed);
-	cfsetospeed(&tio, speed);
-	tcsetattr(tty, TCSANOW, &tio);
+	ret = tcsetattr(tty, TCSANOW, &tio);
+	if (ret) {
+		perror("Can't configure serial port");
+		return -errno;
+	}
 
 	s->stream.string_data = false;
 	s->stream.notify_read = poe_stream_msg_cb;
@@ -700,6 +708,7 @@ poe_initial_setup(void)
 {
 	poe_cmd_status();
 	poe_cmd_power_mgmt_mode(2);
+	poe_cmd_port_mapping_enable(false);
 	poe_cmd_global_power_budget(0, 0);
 	poe_cmd_global_port_enable(0);
 	poe_cmd_global_power_budget(config.budget, config.budget_guard);
@@ -773,6 +782,48 @@ ubus_poe_info_cb(struct ubus_context *ctx, struct ubus_object *obj,
 	return UBUS_STATUS_OK;
 }
 
+enum {
+	POE_SENDFRAME_STRING,
+	__POE_SENDFRAME_MAX
+};
+
+static const struct blobmsg_policy ubus_poe_sendframe_policy[__POE_SENDFRAME_MAX] = {
+	[POE_SENDFRAME_STRING] = { "frame", BLOBMSG_TYPE_STRING },
+};
+
+static int
+ubus_poe_sendframe_cb(struct ubus_context *ctx, struct ubus_object *obj,
+		   struct ubus_request_data *req, const char *method,
+		   struct blob_attr *msg)
+{
+	struct blob_attr *tb[__POE_SENDFRAME_MAX];
+	char *frame, *next, *end;
+	size_t cmd_len = 0;
+	unsigned long byte_val;
+	uint8_t cmd[9];
+
+	blobmsg_parse(ubus_poe_sendframe_policy, __POE_SENDFRAME_MAX, tb, blob_data(msg), blob_len(msg));
+
+	if (!tb[POE_SENDFRAME_STRING])
+		return UBUS_STATUS_INVALID_ARGUMENT;
+
+	frame = blobmsg_get_string(tb[POE_SENDFRAME_STRING]);
+	end = frame + strlen(frame);
+	next = frame;
+
+	while ((next < end) && (cmd_len < sizeof(cmd))) {
+		errno = 0;
+		byte_val = strtoul(frame, &next, 16);
+		if (errno || (frame == next) || (byte_val > 0xff))
+			return UBUS_STATUS_INVALID_ARGUMENT;
+
+		cmd[cmd_len++] = byte_val;
+		frame = next;
+	}
+
+	return poe_cmd_queue(cmd, cmd_len);
+}
+
 static int
 ubus_poe_reload_cb(struct ubus_context *ctx, struct ubus_object *obj,
 		   struct ubus_request_data *req, const char *method,
@@ -787,6 +838,7 @@ ubus_poe_reload_cb(struct ubus_context *ctx, struct ubus_object *obj,
 static const struct ubus_method ubus_poe_methods[] = {
 	UBUS_METHOD_NOARG("info", ubus_poe_info_cb),
 	UBUS_METHOD_NOARG("reload", ubus_poe_reload_cb),
+	UBUS_METHOD("sendframe", ubus_poe_sendframe_cb, ubus_poe_sendframe_policy),
 };
 
 static struct ubus_object_type ubus_poe_object_type =
@@ -833,6 +885,7 @@ main(int argc, char ** argv)
 
 	if (poe_stream_open("/dev/ttyS1", &stream, B19200) < 0)
 		return -1;
+
 
 	poe_initial_setup();
 	state_timeout.cb = state_timeout_cb;
