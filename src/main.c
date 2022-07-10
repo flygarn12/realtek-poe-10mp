@@ -24,7 +24,8 @@
 typedef int (*poe_reply_handler)(unsigned char *reply);
 
 #define MAX_PORT	24
-#define GET_STR(a, b)	(a < ARRAY_SIZE(b) ? b[a] : NULL)
+#define GET_STR(a, b)	((a) < ARRAY_SIZE(b) ? (b)[a] : NULL)
+#define MAX(a, b)	(((a) > (b)) ? (a) : (b))
 
 struct port_config {
 	char name[16];
@@ -37,26 +38,28 @@ struct port_config {
 struct config {
 	int debug;
 
-	int budget;
-	int budget_guard;
+	float budget;
+	float budget_guard;
 
-	int port_count;
+	unsigned int port_count;
+	uint8_t pse_id_set_budget_mask;
 	struct port_config ports[MAX_PORT];
 };
 
 struct port_state {
-	char *status;
+	const char *status;
 	float watt;
-	char *poe_mode;
+	const char *poe_mode;
 };
 
 struct state {
-	char *sys_mode;
+	const char *sys_mode;
 	unsigned char sys_version;
-	char *sys_mcu;
-	char *sys_status;
+	const char *sys_mcu;
+	const char *sys_status;
 	unsigned char sys_ext_version;
 	float power_consumption;
+	unsigned int num_detected_ports;
 
 	struct port_state ports[MAX_PORT];
 };
@@ -66,8 +69,6 @@ struct cmd {
 	unsigned char cmd[12];
 };
 
-static struct uloop_timeout state_timeout;
-static struct ubus_auto_conn conn;
 static struct ustream_fd stream;
 static LIST_HEAD(cmd_pending);
 static unsigned char cmd_seq;
@@ -77,7 +78,7 @@ static struct blob_buf b;
 static struct config config = {
 	.budget = 65,
 	.budget_guard = 7,
-	.port_count = 8,
+	.pse_id_set_budget_mask = 0x01,
 };
 
 static uint16_t read16_be(uint8_t *raw)
@@ -91,99 +92,51 @@ static void write16_be(uint8_t *raw, uint16_t value)
 	raw[1] =  value & 0xff;
 }
 
-static void
-config_load_port(struct uci_section *s)
+static void load_port_config(struct uci_context *uci, struct uci_section *s)
 {
-	enum {
-		PORT_ATTR_ID,
-		PORT_ATTR_NAME,
-		PORT_ATTR_ENABLE,
-		PORT_ATTR_PRIO,
-		PORT_ATTR_POE_PLUS,
-		__PORT_ATTR_MAX,
-	};
+	const char * name, *id_str, *enable, *priority, *poe_plus;
+	unsigned long id;
 
-	static const struct blobmsg_policy port_attrs[__PORT_ATTR_MAX] = {
-		[PORT_ATTR_ID] = { .name = "id", .type = BLOBMSG_TYPE_INT32 },
-		[PORT_ATTR_NAME] = { .name = "name", .type = BLOBMSG_TYPE_STRING },
-		[PORT_ATTR_ENABLE] = { .name = "enable", .type = BLOBMSG_TYPE_INT32 },
-		[PORT_ATTR_PRIO] = { .name = "priority", .type = BLOBMSG_TYPE_INT32 },
-		[PORT_ATTR_POE_PLUS] = { .name = "poe_plus", .type = BLOBMSG_TYPE_INT32 },
-	};
+	id_str = uci_lookup_option_string(uci, s, "id");
+	name = uci_lookup_option_string(uci, s, "name");
+	enable = uci_lookup_option_string(uci, s, "enable");
+	priority = uci_lookup_option_string(uci, s, "priority");
+	poe_plus = uci_lookup_option_string(uci, s, "poe_plus");
 
-	const struct uci_blob_param_list port_attr_list = {
-		.n_params = __PORT_ATTR_MAX,
-		.params = port_attrs,
-	};
-
-	struct blob_attr *tb[__PORT_ATTR_MAX] = { 0 };
-	const char *name;
-	unsigned int id;
-
-	blob_buf_init(&b, 0);
-	uci_to_blob(&b, s, &port_attr_list);
-	blobmsg_parse(port_attrs, __PORT_ATTR_MAX, tb, blob_data(b.head), blob_len(b.head));
-
-	if (!tb[PORT_ATTR_ID] || !tb[PORT_ATTR_NAME]) {
+	if (!id_str || !name) {
 		ULOG_ERR("invalid port with missing name and id");
 		return;
 	}
 
-	name = blobmsg_get_string(tb[PORT_ATTR_NAME]);
-	id = blobmsg_get_u32(tb[PORT_ATTR_ID]);
+	id = strtoul(id_str, NULL, 0);
 	if (!id || id > MAX_PORT) {
-		ULOG_ERR("invalid port id=%u for %s", id, name);
+		ULOG_ERR("invalid port id=%lu for %s", id, name);
 		return;
 	}
+	config.port_count = MAX(config.port_count, id);
 	id--;
 
-	strncpy(config.ports[id].name, name, 16);
-
-	if (tb[PORT_ATTR_ENABLE])
-		config.ports[id].enable = !!blobmsg_get_u32(tb[PORT_ATTR_ENABLE]);
-
-	if (tb[PORT_ATTR_PRIO])
-		config.ports[id].priority = blobmsg_get_u32(tb[PORT_ATTR_PRIO]);
+	strncpy(config.ports[id].name, name, sizeof(config.ports[id].name));
+	config.ports[id].enable = enable ? !strcmp(enable, "1") : 0;
+	config.ports[id].priority = priority ? strtoul(priority, NULL, 0) : 0;
 	if (config.ports[id].priority > 3)
 		config.ports[id].priority = 3;
 
-	if (tb[PORT_ATTR_POE_PLUS] && blobmsg_get_u32(tb[PORT_ATTR_POE_PLUS]))
+	if (poe_plus && !strcmp(poe_plus, "1"))
 		config.ports[id].power_up_mode = 3;
 }
 
-static void
-config_load_global(struct uci_section *s)
+static void load_global_config(struct uci_context *uci, struct uci_section *s)
 {
-	enum {
-		GLOBAL_ATTR_BUDGET,
-		GLOBAL_ATTR_GUARD,
-		__GLOBAL_ATTR_MAX,
-	};
+	const char *budget, *guardband;
 
-	static const struct blobmsg_policy global_attrs[__GLOBAL_ATTR_MAX] = {
-		[GLOBAL_ATTR_BUDGET] = { .name = "budget", .type = BLOBMSG_TYPE_INT32 },
-		[GLOBAL_ATTR_GUARD] = { .name = "guard", .type = BLOBMSG_TYPE_INT32 },
-	};
+	budget = uci_lookup_option_string(uci, s, "budget");
+	guardband = uci_lookup_option_string(uci, s, "guard");
 
-	const struct uci_blob_param_list global_attr_list = {
-		.n_params = __GLOBAL_ATTR_MAX,
-		.params = global_attrs,
-	};
-
-	struct blob_attr *tb[__GLOBAL_ATTR_MAX] = { 0 };
-
-	blob_buf_init(&b, 0);
-	uci_to_blob(&b, s, &global_attr_list);
-	blobmsg_parse(global_attrs, __GLOBAL_ATTR_MAX, tb, blob_data(b.head), blob_len(b.head));
-
-	config.budget = 65;
-	if (tb[GLOBAL_ATTR_BUDGET])
-		config.budget = blobmsg_get_u32(tb[GLOBAL_ATTR_BUDGET]);
-
-	if (tb[GLOBAL_ATTR_GUARD])
-		config.budget_guard = blobmsg_get_u32(tb[GLOBAL_ATTR_GUARD]);
-	else
-		config.budget_guard = config.budget / 10;
+	config.budget = budget ? strtof(budget, NULL) : 31.0;
+	config.budget_guard = config.budget / 10;
+	if (guardband)
+		config.budget_guard = strtof(guardband, NULL);
 }
 
 static void
@@ -202,18 +155,54 @@ config_load(int init)
 				struct uci_section *s = uci_to_section(e);
 
 				if (!strcmp(s->type, "global"))
-					config_load_global(s);
+					load_global_config(uci, s);
 			}
 		uci_foreach_element(&package->sections, e) {
 			struct uci_section *s = uci_to_section(e);
 
 			if (!strcmp(s->type, "port"))
-				config_load_port(s);
+				load_port_config(uci, s);
 		}
 	}
 
 	uci_unload(uci, package);
 	uci_free_context(uci);
+}
+
+static char *get_board_compatible(void)
+{
+	char name[128];
+	int fd, ret;
+
+	fd = open("/sys/firmware/devicetree/base/compatible", O_RDONLY);
+	if (fd < 0)
+		return NULL;
+
+	ret = read(fd, name, sizeof(name));
+	if (ret < 0)
+		return NULL;
+
+	close(fd);
+
+	return strndup(name, ret);
+}
+
+static void config_apply_quirks(struct config *config)
+{
+	char *compatible;
+
+	compatible = get_board_compatible();
+	if (!compatible) {
+		ULOG_ERR("Can't get 'compatible': %s\n", strerror(errno));
+		return;
+	}
+
+	if (!strcmp(compatible, "zyxel,gs1900-24hp-v1")) {
+		/* Send budget command to first 8 PSE IDs */
+		config->pse_id_set_budget_mask = 0xff;
+	}
+
+	free(compatible);
 }
 
 static void
@@ -224,16 +213,16 @@ poe_cmd_dump(char *type, unsigned char *data)
 	if (!config.debug)
 		return;
 
-	fprintf(stderr, "%s ->", type);
+	fprintf(stderr, "%s", type);
 	for (i = 0; i < 12; i++)
-		fprintf(stderr, " 0x%02x", data[i]);
+		fprintf(stderr, " %02x", data[i]);
 	fprintf(stderr, "\n");
 }
 
 static int
 poe_cmd_send(struct cmd *cmd)
 {
-	poe_cmd_dump("TX", cmd->cmd);
+	poe_cmd_dump("TX ->", cmd->cmd);
 	ustream_write(&stream.stream, (char *)cmd->cmd, 12, false);
 
 	return 0;
@@ -292,20 +281,6 @@ poe_cmd_port_enable(unsigned char port, unsigned char enable)
 static int poe_cmd_port_mapping_enable(bool enable)
 {
 	unsigned char cmd[] = { 0x02, 0x00, enable };
-
-	return poe_cmd_queue(cmd, sizeof(cmd));
-}
-
-/* 0x06 - Set global port enable
- *	0: Disable PSE Functionality on all Ports
- *	1: Enable PSE Functionality on all Ports
- *	2: Enable Force power Functionality on all ports
- *	3: Enable Force Power with Disconnect Functionality on all Ports
- */
-static int
-poe_cmd_global_port_enable(unsigned char enable)
-{
-	unsigned char cmd[] = { 0x06, 0x00, enable };
 
 	return poe_cmd_queue(cmd, sizeof(cmd));
 }
@@ -392,10 +367,9 @@ poe_cmd_power_mgmt_mode(unsigned char mode)
 }
 
 /* 0x18 - Set global power budget */
-static int
-poe_cmd_global_power_budget(int budget, int guard)
+static int poe_cmd_global_power_budget(uint8_t pse, float budget, float guard)
 {
-	unsigned char cmd[] = { 0x18, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+	uint8_t cmd[] = { 0x18, 0x00, pse, 0x00, 0x00, 0x00, 0x00 };
 
 	write16_be(cmd + 3, budget * 10);
 	write16_be(cmd + 5, guard * 10);
@@ -443,20 +417,20 @@ poe_cmd_status(void)
 static int
 poe_reply_status(unsigned char *reply)
 {
-	static char *mode[]={
+	const char *mode[] = {
 		"Semi-auto I2C",
 		"Semi-auto UART",
 		"Auto I2C",
 		"Auto UART"
 	};
-	static char *mcu[]={
+	const char *mcu[] = {
 		"ST Micro ST32F100 Microcontroller",
 		"Nuvoton M05xx LAN Microcontroller",
 		"ST Micro STF030C8 Microcontroller",
 		"Nuvoton M058SAN Microcontroller",
 		"Nuvoton NUC122 Microcontroller"
 	};
-	static char *status[]={
+	const char *status[] = {
 		"Global Disable pin is de-asserted:No system reset from the previous query cmd:Configuration saved",
 		"Global Disable pin is de-asserted:No system reset from the previous query cmd:Configuration Dirty",
 		"Global Disable pin is de-asserted:System reseted:Configuration saved",
@@ -468,7 +442,7 @@ poe_reply_status(unsigned char *reply)
 	};
 
 	state.sys_mode = GET_STR(reply[2], mode);
-	config.port_count = reply[3];
+	state.num_detected_ports = reply[3];
 	state.sys_version = reply[7];
 	state.sys_mcu = GET_STR(reply[8], mcu);
 	state.sys_status = GET_STR(reply[9], status);
@@ -506,7 +480,7 @@ poe_cmd_port_ext_config(unsigned char port)
 static int
 poe_reply_port_ext_config(unsigned char *reply)
 {
-	static char *mode[] = {
+	const char *mode[] = {
 		"PoE",
 		"Legacy",
 		"pre-PoE+",
@@ -518,30 +492,40 @@ poe_reply_port_ext_config(unsigned char *reply)
 	return 0;
 }
 
-/* 0x2a - Get all port status */
-static int
-poe_cmd_port_overview(void)
+/* 0x28 - Get all all port status */
+static int poe_cmd_4_port_status(uint8_t p1, uint8_t p2, uint8_t p3, uint8_t p4)
 {
-	unsigned char cmd[] = { 0x2a, 0x00, 0x00 };
+	uint8_t cmd[] = { 0x28, 0x00, p1, 1, p2, 1, p3, 1, p4, 1 };
 
 	return poe_cmd_queue(cmd, sizeof(cmd));
 }
 
-static int
-poe_reply_port_overview(unsigned char *reply)
+static int poe_reply_4_port_status(uint8_t *reply)
 {
-	static char *status[]={
-		"Disabled",
-		"Searching",
-		"Delivering power",
-		"Fault",
-		"Other fault",
-		"Requesting power",
-	};
-	int i;
+	int i, port, pstate;
 
-	for (i = 0; i < MAX_PORT; i++)
-		state.ports[i].status = GET_STR((reply[3 + i] & 0xf), status);
+	const char *status[] = {
+		[0] = "Disabled",
+		[1] = "Searching",
+		[2] = "Delivering power",
+		[4] = "Fault",
+		[5] = "Other fault",
+		[6] = "Requesting power",
+	};
+
+	for (i = 2; i < 11; i+=2) {
+		port = reply[i];
+		pstate = reply[i + 1];
+
+		if (port == 0xff) {
+			continue;
+		} else if (port >= MAX_PORT) {
+			ULOG_WARN("Invalid port status packet (port=%d)\n", port);
+			return -1;
+		}
+
+		state.ports[port].status = GET_STR(pstate & 0xf, status);
+	}
 
 	return 0;
 }
@@ -568,7 +552,7 @@ static poe_reply_handler reply_handler[] = {
 	[0x20] = poe_reply_status,
 	[0x23] = poe_reply_power_stats,
 	[0x26] = poe_reply_port_ext_config,
-	[0x2a] = poe_reply_port_overview,
+	[0x28] = poe_reply_4_port_status,
 	[0x30] = poe_reply_port_power_stats,
 };
 
@@ -578,7 +562,7 @@ poe_reply_consume(unsigned char *reply)
 	struct cmd *cmd = NULL;
 	unsigned char sum = 0, i;
 
-	poe_cmd_dump("RX", reply);
+	poe_cmd_dump("RX <-", reply);
 
 	if (list_empty(&cmd_pending)) {
 		ULOG_ERR("received unsolicited reply\n");
@@ -678,7 +662,7 @@ poe_stream_open(char *dev, struct ustream_fd *s, speed_t speed)
 static int
 poe_port_setup(void)
 {
-	int i;
+	size_t i;
 
 	for (i = 0; i < config.port_count; i++) {
 		if (!config.ports[i].enable) {
@@ -703,15 +687,26 @@ poe_port_setup(void)
 	return 0;
 }
 
+static void poe_set_power_budget(const struct config *config)
+{
+	unsigned int pse;
+
+	for (pse = 0; pse < 8; pse++) {
+		if (!(config->pse_id_set_budget_mask & (1 << pse)))
+			continue;
+
+		poe_cmd_global_power_budget(pse, config->budget,
+					    config->budget_guard);
+	}
+}
+
 static int
 poe_initial_setup(void)
 {
 	poe_cmd_status();
 	poe_cmd_power_mgmt_mode(2);
 	poe_cmd_port_mapping_enable(false);
-	poe_cmd_global_power_budget(0, 0);
-	poe_cmd_global_port_enable(0);
-	poe_cmd_global_power_budget(config.budget, config.budget_guard);
+	poe_set_power_budget(&config);
 
 	poe_port_setup();
 
@@ -721,17 +716,19 @@ poe_initial_setup(void)
 static void
 state_timeout_cb(struct uloop_timeout *t)
 {
-	int i;
+	size_t i;
 
 	poe_cmd_power_stats();
-	poe_cmd_port_overview();
+
+	for (i = 0; i < config.port_count; i += 4)
+		poe_cmd_4_port_status(i, i + 1, i + 2, i + 3);
 
 	for (i = 0; i < config.port_count; i++) {
 		poe_cmd_port_ext_config(i);
 		poe_cmd_port_power_stats(i);
 	}
 
-	uloop_timeout_set(&state_timeout, 2 * 1000);
+	uloop_timeout_set(t, 2 * 1000);
 }
 
 static int
@@ -740,8 +737,8 @@ ubus_poe_info_cb(struct ubus_context *ctx, struct ubus_object *obj,
 		 struct blob_attr *msg)
 {
 	char tmp[16];
+	size_t i;
 	void *c;
-	int i;
 
 	blob_buf_init(&b, 0);
 
@@ -782,13 +779,8 @@ ubus_poe_info_cb(struct ubus_context *ctx, struct ubus_object *obj,
 	return UBUS_STATUS_OK;
 }
 
-enum {
-	POE_SENDFRAME_STRING,
-	__POE_SENDFRAME_MAX
-};
-
-static const struct blobmsg_policy ubus_poe_sendframe_policy[__POE_SENDFRAME_MAX] = {
-	[POE_SENDFRAME_STRING] = { "frame", BLOBMSG_TYPE_STRING },
+static const struct blobmsg_policy ubus_poe_sendframe_policy[] = {
+	{ "frame", BLOBMSG_TYPE_STRING },
 };
 
 static int
@@ -796,18 +788,19 @@ ubus_poe_sendframe_cb(struct ubus_context *ctx, struct ubus_object *obj,
 		   struct ubus_request_data *req, const char *method,
 		   struct blob_attr *msg)
 {
-	struct blob_attr *tb[__POE_SENDFRAME_MAX];
+	struct blob_attr *tb[ARRAY_SIZE(ubus_poe_sendframe_policy)];
 	char *frame, *next, *end;
 	size_t cmd_len = 0;
 	unsigned long byte_val;
 	uint8_t cmd[9];
 
-	blobmsg_parse(ubus_poe_sendframe_policy, __POE_SENDFRAME_MAX, tb, blob_data(msg), blob_len(msg));
-
-	if (!tb[POE_SENDFRAME_STRING])
+	blobmsg_parse(ubus_poe_sendframe_policy,
+		      ARRAY_SIZE(ubus_poe_sendframe_policy),
+		      tb, blob_data(msg), blob_len(msg));
+	if (!*tb)
 		return UBUS_STATUS_INVALID_ARGUMENT;
 
-	frame = blobmsg_get_string(tb[POE_SENDFRAME_STRING]);
+	frame = blobmsg_get_string(*tb);
 	end = frame + strlen(frame);
 	next = frame;
 
@@ -866,6 +859,14 @@ main(int argc, char ** argv)
 {
 	int ch;
 
+	struct uloop_timeout state_timeout = {
+		.cb = state_timeout_cb,
+	};
+
+	struct ubus_auto_conn conn = {
+		.cb = ubus_connect_handler,
+	};
+
 	ulog_open(ULOG_STDIO | ULOG_SYSLOG, LOG_DAEMON, "realtek-poe-10mp");
 	ulog_threshold(LOG_INFO);
 
@@ -878,9 +879,9 @@ main(int argc, char ** argv)
 	}
 
 	config_load(1);
+	config_apply_quirks(&config);
 
 	uloop_init();
-	conn.cb = ubus_connect_handler;
 	ubus_auto_connect(&conn);
 
 	if (poe_stream_open("/dev/ttyS1", &stream, B19200) < 0)
@@ -888,7 +889,6 @@ main(int argc, char ** argv)
 
 
 	poe_initial_setup();
-	state_timeout.cb = state_timeout_cb;
 	uloop_timeout_set(&state_timeout, 1000);
 	uloop_run();
 	uloop_done();
